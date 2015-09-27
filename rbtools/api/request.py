@@ -12,7 +12,7 @@ from json import loads as json_loads
 
 import six
 from six.moves.http_client import UNAUTHORIZED
-from six.moves.http_cookiejar import Cookie, MozillaCookieJar
+from six.moves.http_cookiejar import Cookie, CookieJar, MozillaCookieJar
 from six.moves.urllib.error import HTTPError, URLError
 from six.moves.urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from six.moves.urllib.request import (
@@ -102,12 +102,12 @@ class HttpRequest(object):
 
         for key in self._fields:
             content.write(b'--' + BOUNDARY + NEWLINE)
-            content.write(('Content-Disposition: form-data; '
-                           'name="%s"' % key).encode('utf-8'))
+            content.write(b'Content-Disposition: form-data; '
+                          b'name="%s"' % key.encode('utf-8'))
             content.write(NEWLINE + NEWLINE)
 
-            if isinstance(self._fields[key], six.string_types):
-                content.write(self._fields[key].encode('utf-8') + NEWLINE)
+            if isinstance(self._fields[key], six.binary_type):
+                content.write(self._fields[key] + NEWLINE)
             else:
                 content.write(six.text_type(self._fields[key]).encode('utf-8')
                               + NEWLINE)
@@ -138,8 +138,7 @@ class HttpRequest(object):
             content.write(NEWLINE)
 
         content.write(b'--' + BOUNDARY + b'--' + NEWLINE + NEWLINE)
-        content_type = ('multipart/form-data; boundary=%s' %
-                        BOUNDARY.decode('utf-8')).encode('utf-8')
+        content_type = b'multipart/form-data; boundary=%s' % BOUNDARY
 
         return content_type, content.getvalue()
 
@@ -405,19 +404,25 @@ class ReviewBoardServer(object):
     def __init__(self, url, cookie_file=None, username=None, password=None,
                  api_token=None, agent=None, session=None, disable_proxy=False,
                  auth_callback=None, otp_token_callback=None,
-                 disable_ssl_verification=False):
-        self.url = url
-        if not self.url.endswith('/'):
-            self.url += '/'
+                 verify_ssl=True, save_cookies=True):
+        if not url.endswith('/'):
+            url += '/'
 
-        self.url = self.url + 'api/'
-        self.cookie_jar, self.cookie_file = create_cookie_jar(
-            cookie_file=cookie_file)
+        self.url = url + 'api/'
 
-        try:
-            self.cookie_jar.load(ignore_expires=True)
-        except IOError:
-            pass
+        self.save_cookies = save_cookies
+
+        if self.save_cookies:
+            self.cookie_jar, self.cookie_file = create_cookie_jar(
+                cookie_file=cookie_file)
+
+            try:
+                self.cookie_jar.load(ignore_expires=True)
+            except IOError:
+                pass
+        else:
+            self.cookie_jar = CookieJar()
+            self.cookie_file = None
 
         # Get the cookie domain from the url. If the domain
         # does not contain a '.' (e.g. 'localhost'), we assume
@@ -447,7 +452,19 @@ class ReviewBoardServer(object):
                 comment_url=None,
                 rest={'HttpOnly': None})
             self.cookie_jar.set_cookie(cookie)
-            self.cookie_jar.save()
+
+            if self.save_cookies:
+                self.cookie_jar.save()
+
+        if username:
+            # If the username parameter is given, we have to clear the session
+            # cookie manually or it will override the username:password
+            # combination retrieved from the authentication callback.
+            try:
+                self.cookie_jar.clear(self.domain, parsed_url[2],
+                                      RB_COOKIE_NAME)
+            except KeyError:
+                pass
 
         # Set up the HTTP libraries to support all of the features we need.
         password_mgr = ReviewBoardHTTPPasswordMgr(self.url,
@@ -461,7 +478,7 @@ class ReviewBoardServer(object):
 
         handlers = []
 
-        if disable_ssl_verification:
+        if not verify_ssl:
             context = ssl._create_unverified_context()
             handlers.append(HTTPSHandler(context=context))
 
@@ -490,10 +507,18 @@ class ReviewBoardServer(object):
         self._cache = None
         self._urlopen = urlopen
 
-    def enable_cache(self):
-        """Enable caching for all future requests."""
+    def enable_cache(self, cache_location=None, in_memory=False):
+        """Enable caching for all future HTTP requests.
+
+        The cache will be created at the default location if none is provided.
+
+        If the in_memory parameter is True, the cache will be created in memory
+        instead of on disk. This overrides the cache_location parameter.
+        """
         if not self._cache:
-            self._cache = APICache()
+            self._cache = APICache(create_db_in_memory=in_memory,
+                                   db_location=cache_location)
+
             self._urlopen = self._cache.make_request
 
     def login(self, username, password):
@@ -506,7 +531,9 @@ class ReviewBoardServer(object):
         self.make_request(HttpRequest('%ssession/' % self.url,
                                       method='DELETE'))
         self.cookie_jar.clear(self.domain)
-        self.cookie_jar.save()
+
+        if self.save_cookies:
+            self.cookie_jar.save()
 
     def process_error(self, http_status, data):
         """Processes an error, raising an APIError with the information."""
@@ -551,9 +578,10 @@ class ReviewBoardServer(object):
         except URLError as e:
             raise ServerInterfaceError('%s' % e.reason)
 
-        try:
-            self.cookie_jar.save()
-        except IOError:
-            pass
+        if self.save_cookies:
+            try:
+                self.cookie_jar.save()
+            except IOError:
+                pass
 
         return rsp
